@@ -3,9 +3,13 @@ import warnings
 import re
 import copy
 from timeit import default_timer as timer
+import scipy.sparse as sp
+import numpy as np
 
 from numpy import unique
-
+from skmultiflow.data.base_stream import Stream
+from skmultiflow.drift_detection import ADWIN
+from skmultiflow.drift_detection.base_drift_detector import BaseDriftDetector
 from skmultiflow.evaluation.base_evaluator import StreamEvaluator
 from skmultiflow.utils import constants
 
@@ -219,11 +223,48 @@ class EvaluatePrequentialDrift(StreamEvaluator):
         warnings.filterwarnings("ignore", ".*invalid value encountered in true_divide.*")
         warnings.filterwarnings("ignore", ".*Passing 1d.*")
 
-    def evaluate(self, stream, model, model_names=None, extractor=None):
+    def _init_evaluation(self, stream, model, model_names=None):
+        # For now, it just suports a single evaluation
+        if isinstance(model, list):
+            if len(model) > 1:
+                raise ValueError("EvaluatePrequentialDrift does not support multiple models yet.")
+        else:
+            self.n_models = 1
+            if not hasattr(model, 'predict'):
+                raise NotImplementedError('{} does not have a predict() method.'.format(model))
+
+        self.model = model if isinstance(model, list) else [model]
+        if isinstance(stream, Stream):
+            self.stream = stream
+        else:
+            raise ValueError('{} is not a valid stream type.'.format(stream))
+
+        if model_names is None:
+            self.model_names = ['M{}'.format(i) for i in range(self.n_models)]
+        else:
+            if isinstance(model_names, list):
+                if len(model_names) != self.n_models:
+                    raise ValueError("Number of model names does not match the number of models.")
+                else:
+                    self.model_names = model_names
+            else:
+                raise ValueError("model_names must be a list.")
+
+    def evaluate(self, stream, model,
+                 drift_detection_method: BaseDriftDetector = ADWIN(0.001),
+                 warning_detection_method: BaseDriftDetector = ADWIN(0.01),
+                 model_names=None,
+                 extractor=None,
+                 scaler=None):
         """ Evaluates a model or set of models on samples from a stream.
 
         Parameters
         ----------
+        drift_detection_method: BaseDriftDetector or None, optional (default=ADWIN(0.001))
+            Drift Detection method.
+        warning_detection_method: BaseDriftDetector or None, default(ADWIN(0.01))
+            Warning Detection method.
+
         stream: Stream
             The stream from which to draw the samples.
 
@@ -234,6 +275,8 @@ class EvaluatePrequentialDrift(StreamEvaluator):
             A list with the names of the models.
 
         extractor: feature extractor to be used. Must have a fit and transform method.
+        If this is enabled, data stream must be composed of RAW data. Both classifiers
+        and drift detector will be reseted when a drift occurs.
 
         Returns
         -------
@@ -246,6 +289,8 @@ class EvaluatePrequentialDrift(StreamEvaluator):
         self.base_model = copy.deepcopy(model)
         if extractor is not None:
             self.base_extractor = copy.deepcopy(extractor)
+        if scaler is not None:
+            self.base_scaler = copy.deepcopy(scaler)
 
         if self._check_configuration():
             self._reset_globals()
@@ -278,7 +323,7 @@ class EvaluatePrequentialDrift(StreamEvaluator):
         """
         self._start_time = timer()
         self._end_time = timer()
-        print('Prequential Evaluation')
+        print('Prequential Evaluation Drift')
         print('Evaluating {} target(s).'.format(self.stream.n_targets))
 
         self.actual_max_samples = self.stream.n_remaining_samples()
@@ -287,9 +332,27 @@ class EvaluatePrequentialDrift(StreamEvaluator):
 
         self.first_run = True
         if self.pretrain_size > 0:
-            print('Pre-training on {} sample(s).'.format(self.pretrain_size))
 
-            X, y = self.stream.next_sample(self.pretrain_size)
+            data, y = self.stream.next_sample(self.pretrain_size)
+
+            # check if feature extractor is enabled
+            if self.base_extractor is not None:
+                print('Extracting feature from {} sample(s).'.format(self.pretrain_size))
+
+                # extract features
+                self.extractor = FeatureExtractor(self.base_extractor)
+                self.extractor.fit(data)
+                X = self.extractor.transform(data)
+
+                # if a scaler is available, normalize items
+                if self.base_scaler is not None:
+                    self.scaler = Scaler(self.base_scaler)
+                    self.scaler.fit(X)
+                    X = self.scaler.transform(X)
+            else:
+                X = data
+
+            print('Pre-training on {} sample(s).'.format(self.pretrain_size))
 
             for i in range(self.n_models):
                 if self._task_type == constants.CLASSIFICATION:
@@ -311,12 +374,21 @@ class EvaluatePrequentialDrift(StreamEvaluator):
 
         update_count = 0
         print('Evaluating...')
-        while ((self.global_sample_count < self.actual_max_samples) & (self._end_time - self._start_time < self.max_time)
+        while ((self.global_sample_count < self.actual_max_samples) & (
+                self._end_time - self._start_time < self.max_time)
                & (self.stream.has_more_samples())):
             try:
                 X, y = self.stream.next_sample(self.batch_size)
 
                 if X is not None and y is not None:
+
+                    # check if feature extractor is enabled
+                    if self.base_extractor is not None:
+                        X = self.extractor.transform(X)
+                        # if a scaler is available, normalize items
+                        if self.base_scaler is not None:
+                            X = self.scaler.transform(X)
+
                     # Test
                     prediction = [[] for _ in range(self.n_models)]
                     for i in range(self.n_models):
@@ -340,7 +412,7 @@ class EvaluatePrequentialDrift(StreamEvaluator):
                     if self.first_run:
                         for i in range(self.n_models):
                             if self._task_type != constants.REGRESSION and \
-                               self._task_type != constants.MULTI_TARGET_REGRESSION:
+                                    self._task_type != constants.MULTI_TARGET_REGRESSION:
                                 # Accounts for the moment of training beginning
                                 self.running_time_measurements[i].compute_training_time_begin()
                                 self.model[i].partial_fit(X, y, self.stream.target_values)
@@ -451,3 +523,67 @@ class EvaluatePrequentialDrift(StreamEvaluator):
             info = re.sub(r"output_file=(.\S+),", "output_file='{}',".format(filename), info)
 
         return info
+
+
+class FeatureExtractor:
+    def __init__(self, extractor):
+        # save models used
+        self.models = []
+        # base extractor
+        self.base_extractor = extractor
+
+    # fit models and return them
+    def fit(self, X_data):
+        # iterate over each column of X_data
+        for i in range(X_data.shape[1]):
+            # get train and test data
+            train_data = X_data[:, i]
+            # initialize model
+            tfidf = copy.deepcopy(self.base_extractor)  # clone(self.base_extractor)
+            # train model
+            tfidf.fit(train_data)
+            # append
+            self.models.append(tfidf)
+        # return models list
+        return self.models
+
+    # transform passed data
+    def transform(self, X_data):
+        X = []
+        # iterate over each column of X_data
+        for i in range(X_data.shape[1]):
+            # get data column
+            train_data = X_data[:, i]
+            # get model for this column
+            model = self.models[i]
+            # transform data
+            X_i = model.transform(train_data).todense().tolist()
+            # if first execution, save only features
+            if len(X) == 0:
+                X = X_i
+            # concatenate existing features
+            else:
+                # iterate over X and X_i
+                for xx, xt in zip(X, X_i):
+                    # iterate over X_i and append to X
+                    for i in xt:
+                        # append i to xx
+                        xx.append(i)
+                # X = np.concatenate((X, X_i), axis=1)
+        # return transformed data
+        return np.array(X)
+
+class Scaler():
+
+    def __init__(self, scaler):
+        self.scaler = copy.deepcopy(scaler)
+
+    def fit(self, X_data):
+        # train scaler
+        self.scaler.fit(X_data)
+        # return trained scaler
+        return self.scaler
+
+    def transform(self,X_data):
+        # transform X_data
+        return self.scaler.transform(X_data)
