@@ -109,6 +109,34 @@ class RawDataStream(DataStream):
 
         self.target_values = self._get_target_values()
 
+    def get_window(self, width):
+        """ Returns last data window from the stream.
+
+        In case a drift occurs, return last window of data.
+
+        Parameters
+        ----------
+        width: int
+            Size of the window.
+
+        Returns
+        -------
+        tuple or tuple list
+            Returns the window instances.
+            For general purposes the return can be treated as a numpy.ndarray.
+        """
+        try:
+
+            self.current_sample_x = self.X[self.sample_idx - width:self.sample_idx, :]
+            self.current_sample_y = self.y[self.sample_idx - width:self.sample_idx, :]
+            if self.n_targets < 2:
+                self.current_sample_y = self.current_sample_y.flatten()
+
+        except IndexError:
+            self.current_sample_x = None
+            self.current_sample_y = None
+        return self.current_sample_x, self.current_sample_y
+
 
 def check_data_consistency(raw_data_frame, allow_nan=False):
     """
