@@ -1,7 +1,7 @@
 import os
 import warnings
 import re
-import copy
+from copy import deepcopy
 from timeit import default_timer as timer
 import scipy.sparse as sp
 import numpy as np
@@ -195,6 +195,7 @@ class EvaluatePrequentialDrift(StreamEvaluator):
         self.output_file = output_file
         self.show_plot = show_plot
         self.data_points_for_classification = data_points_for_classification
+        self.drifts = []
 
         if not self.data_points_for_classification:
             if metrics is None:
@@ -289,11 +290,14 @@ class EvaluatePrequentialDrift(StreamEvaluator):
         """
         self._init_evaluation(model=model, stream=stream, model_names=model_names)
         # save base model and extractor (if it is enabled)
-        self.base_model = copy.deepcopy(model)
+        self.base_model = deepcopy(model)
         if extractor is not None:
-            self.base_extractor = copy.deepcopy(extractor)
+            self.base_extractor = deepcopy(extractor)
         if scaler is not None:
-            self.base_scaler = copy.deepcopy(scaler)
+            self.base_scaler = deepcopy(scaler)
+
+        self.drift_detector = drift_detection_method
+        self.warning_detector = warning_detection_method
 
         if self._check_configuration():
             self._reset_globals()
@@ -409,8 +413,37 @@ class EvaluatePrequentialDrift(StreamEvaluator):
                         for i in range(len(prediction[0])):
                             self.mean_eval_measurements[j].add_result(y[i], prediction[j][i])
                             self.current_eval_measurements[j].add_result(y[i], prediction[j][i])
+                            self.drift_detector.add_element(int(y[i]==prediction[j][i]))
                     self._check_progress(self.actual_max_samples)
 
+                    # check if has change to change model
+                    if self.drift_detector.detected_change():
+                        # print("Change detected in {}.".format((self.global_sample_count)))
+                        self.drifts.append(self.global_sample_count)
+                        # get last window of data
+                        data, y = self.stream.get_window(self.drift_detector.width)
+                        # extract feature again if has extractor
+                        if self.base_extractor is not None:
+                            # extract features
+                            self.extractor = FeatureExtractor(self.base_extractor)
+                            self.extractor.fit(data)
+                            X = self.extractor.transform(data)
+
+                            # if a scaler is available, normalize items
+                            if self.base_scaler is not None:
+                                self.scaler = Scaler(self.base_scaler)
+                                self.scaler.fit(X)
+                                X = self.scaler.transform(X)
+                        else:
+                            X = data
+
+                        # reset classifier
+                        # for i in range(self.n_models):
+                        #     self.model[i] = deepcopy()(self.base_model[i])
+                        self.model= deepcopy(self.base_model)
+
+                        # reset drift detector
+                        self.drift_detector.reset()
                     # Train
                     if self.first_run:
                         for i in range(self.n_models):
@@ -460,6 +493,9 @@ class EvaluatePrequentialDrift(StreamEvaluator):
 
         if self.restart_stream:
             self.stream.restart()
+
+        print("Drifts detected: {}".format(len(self.drifts)))
+        print("Drift points: {}", self.drifts)
 
         return self.model
 
@@ -542,7 +578,7 @@ class FeatureExtractor:
             # get train and test data
             train_data = X_data[:, i]
             # initialize model
-            tfidf = copy.deepcopy(self.base_extractor)  # clone(self.base_extractor)
+            tfidf = deepcopy(self.base_extractor)  # clone(self.base_extractor)
             # train model
             tfidf.fit(train_data)
             # append
@@ -579,7 +615,7 @@ class FeatureExtractor:
 class Scaler():
 
     def __init__(self, scaler):
-        self.scaler = copy.deepcopy(scaler)
+        self.scaler = deepcopy(scaler)
 
     def fit(self, X_data):
         # train scaler
