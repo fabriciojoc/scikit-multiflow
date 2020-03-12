@@ -495,7 +495,7 @@ class EvaluatePrequentialDrift(StreamEvaluator):
             self.stream.restart()
 
         print("Drifts detected: {}".format(len(self.drifts)))
-        print("Drift points: {}", self.drifts)
+        print("Drift points: {}".format(self.drifts))
 
         return self.model
 
