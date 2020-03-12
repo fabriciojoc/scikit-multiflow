@@ -228,12 +228,15 @@ class EvaluatePrequentialDrift(StreamEvaluator):
         if isinstance(model, list):
             if len(model) > 1:
                 raise ValueError("EvaluatePrequentialDrift does not support multiple models yet.")
+            else:
+                self.n_models = 1
         else:
             self.n_models = 1
             if not hasattr(model, 'predict'):
                 raise NotImplementedError('{} does not have a predict() method.'.format(model))
 
         self.model = model if isinstance(model, list) else [model]
+
         if isinstance(stream, Stream):
             self.stream = stream
         else:
@@ -372,7 +375,7 @@ class EvaluatePrequentialDrift(StreamEvaluator):
             self.global_sample_count += self.pretrain_size
             self.first_run = False
 
-        update_count = 0
+        self.update_count = 0
         print('Evaluating...')
         while ((self.global_sample_count < self.actual_max_samples) & (
                 self._end_time - self._start_time < self.max_time)
@@ -435,10 +438,10 @@ class EvaluatePrequentialDrift(StreamEvaluator):
 
                     if ((self.global_sample_count % self.n_wait) == 0 or
                             (self.global_sample_count >= self.max_samples) or
-                            (self.global_sample_count / self.n_wait > update_count + 1)):
+                            (self.global_sample_count / self.n_wait > self.update_count + 1)):
                         if prediction is not None:
                             self._update_metrics()
-                        update_count += 1
+                        self.update_count += 1
 
                 self._end_time = timer()
             except BaseException as exc:
